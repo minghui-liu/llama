@@ -253,6 +253,8 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        g: torch.Tensor,
+        gv: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
@@ -262,6 +264,8 @@ class Attention(nn.Module):
 
         Args:
             x (torch.Tensor): Input tensor.
+            g (torch.Tensor): Input tensor for graph nodes ids.
+            gv (torch.Tensor): Input tensor for graph node values.
             start_pos (int): Starting position for caching.
             freqs_cis (torch.Tensor): Precomputed frequency tensor.
             mask (torch.Tensor, optional): Attention mask tensor.
@@ -271,7 +275,14 @@ class Attention(nn.Module):
 
         """
         bsz, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        bsz, gseqlen, _ = g.shape
+
+        # merge text and graph inputs
+        x = torch.cat([x, g], dim=1)
+        xgv = torch.cat([x, gv], dim=1)
+        seqlen += gseqlen
+
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(xgv)
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -386,6 +397,8 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        seq_len: int,
+        gseq_len: int,
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
@@ -395,6 +408,8 @@ class TransformerBlock(nn.Module):
 
         Args:
             x (torch.Tensor): Input tensor.
+            g (torch.Tensor): Input tensor for graph nodes ids.
+            gv (torch.Tensor): Input tensor for graph node values.
             start_pos (int): Starting position for attention caching.
             freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
             mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
@@ -403,8 +418,16 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention.forward(
-            self.attention_norm(x), start_pos, freqs_cis, mask
+        # split x into text, graph_id, graph_value inputs        
+        xx, g, gv = x[:, :seq_len], x[:, seq_len:seq_len+gseq_len], x[:, seq_len+gseq_len:]
+
+        h = xx + self.attention.forward(
+            self.attention_norm(xx),
+            self.attention_norm(g),
+            self.attention_norm(gv),
+            start_pos,
+            freqs_cis,
+            mask
         )
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
@@ -454,12 +477,13 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, g_tokens, start_pos: int):
         """
         Perform a forward pass through the Transformer model.
 
         Args:
             tokens (torch.Tensor): Input token indices.
+            g_tokens (torch.Tensor): Input graph node indices.
             start_pos (int): Starting position for attention caching.
 
         Returns:
@@ -467,6 +491,8 @@ class Transformer(nn.Module):
 
         """
         _bsz, seqlen = tokens.shape
+        _gbsz, gseqlen = g_tokens.shape
+        assert _bsz == _gbsz
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
